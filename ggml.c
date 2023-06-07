@@ -329,7 +329,7 @@ static ggml_fp16_t table_silu_f16[1 << 16];
 static ggml_fp16_t table_exp_f16[1 << 16];
 
 // precomputed f32 table for f16 (256 KB)
-static float table_f32_f16[1 << 16];
+float table_f32_f16[1 << 16];
 
 #if defined(__ARM_NEON) || defined(__wasm_simd128__)
 #define B1(c,s,n)  0x ## n ## c ,  0x ## n ## s
@@ -815,6 +815,44 @@ typedef struct {
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(float) + QK8_1, "wrong q8_1 block size/padding");
 
+int ocl_context_init();
+int ocl_mul_mat_q4_q8_init();
+int ocl_enabled = 0;
+void ocl_mul_mat_q4_q8(
+    block_q4_0* vx,
+    block_q8_0* vy,
+    float* output,
+    const unsigned int src0_bytes,
+    const unsigned int src1_bytes,
+    const unsigned int dst_bytes,
+    const unsigned int src0_y_width,
+    const unsigned int src0_x_stride,
+    const unsigned int src1_y_width,
+    const unsigned int src1_x_stride,
+    const unsigned int block_count,
+    const unsigned int dst_x_width,
+    const unsigned int dst_y_width,
+    const unsigned int dst_count
+);
+void ocl_mul_mat_q4_q8_half_raw(
+    block_q4_0* vx,
+    char* vyqs,
+    ggml_fp16_t* vyd,
+    float* output,
+    const unsigned int src0_bytes,
+    const unsigned int src1_bytes,
+    const unsigned int dst_bytes,
+    const unsigned int src0_y_width,
+    const unsigned int src0_x_stride,
+    const unsigned int src1_y_width,
+    const unsigned int src1_x_stride,
+    const unsigned int block_count,
+    const unsigned int dst_x_width,
+    const unsigned int dst_y_width,
+    const unsigned int dst_count
+);
+
+
 // reference implementation for deterministic creation of model files
 static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * restrict y, int k) {
     static const int qk = QK4_0;
@@ -1017,6 +1055,42 @@ static void quantize_row_q8_0_reference(const float * restrict x, block_q8_0 * r
 
             y[i].qs[j] = roundf(x0);
         }
+    }
+}
+
+#define RAW_FIX
+
+// reference implementation for deterministic creation of model files
+static void quantize_row_q8_0_raw(const float* restrict x, int8_t* restrict yqs, ggml_fp16_t * restrict yd, int k) {
+    assert(k % QK8_0 == 0);
+    const int nb = k / QK8_0;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < QK8_0; j++) {
+            const float v = x[i * QK8_0 + j];
+            amax = MAX(amax, fabsf(v));
+        }
+
+        const float d = amax / ((1 << 7) - 1);
+        const float id = d ? 1.0f / d : 0.0f;
+
+        *(yd++) = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < QK8_0; ++j) {
+            const float x0 = x[i * QK8_0 + j] * id;
+
+#ifdef RAW_FIX
+            if (j < QK8_0/2)
+                yqs[j<<1] = roundf(x0);
+            else
+                yqs[((j - QK8_0/2)<<1) + 1] = roundf(x0);
+#else
+            yqs[j] = roundf(x0);
+#endif
+        }
+        yqs += QK8_0;
     }
 }
 
@@ -2164,6 +2238,48 @@ inline static void ggml_vec_dot_f16(const int n, float * restrict s, ggml_fp16_t
         sumf += (ggml_float)(GGML_FP16_TO_FP32(x[i])*GGML_FP16_TO_FP32(y[i]));
     }
 #endif
+
+    *s = sumf;
+}
+
+static void ggml_vec_dot_q4_0_q8_0_half_raw(const int n, float* restrict s, const void* restrict vx, const void* restrict vyqs, const void* restrict vyd) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nb % 2 == 0);
+
+    const block_q4_0* restrict x = vx;
+    const int8_t* restrict yqs = vyqs;
+    const ggml_fp16_t* restrict yd = vyd;
+
+    // scalar
+    float sumf = 0.0;
+
+    for (int i = 0; i < nb; i++) {
+        int sumi = 0;
+
+        for (int j = 0; j < qk / 2; ++j) {
+            const int v0 = (x[i].qs[j] & 0x0F) - 8;
+            const int v1 = (x[i].qs[j] >> 4) - 8;
+#ifdef RAW_FIX
+            const int y0 = *(yqs++);
+            const int y1 = *(yqs++);
+#else
+            const int y0 = *yqs;
+            const int y1 = yqs[qk / 2];
+            yqs++;
+#endif
+            sumi += (v0 * y0) + (v1 * y1);
+        }
+
+        sumf += sumi * GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(*yd);
+#ifdef RAW_FIX
+#else
+        yqs += qk/2;
+#endif
+        yd++;
+    }
 
     *s = sumf;
 }
@@ -3935,6 +4051,8 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
 #elif defined(GGML_USE_CLBLAST)
         ggml_cl_init();
 #endif
+        if (!ocl_context_init() && !ocl_mul_mat_q4_q8_init())
+            ocl_enabled = 1;
 
         is_first_call = false;
     }
@@ -10018,6 +10136,25 @@ static void ggml_compute_forward_mul_mat_q_f32(
 #endif
 
     if (params->type == GGML_TASK_INIT) {
+        if (type == GGML_TYPE_Q4_0) {
+            char* wdata = params->wdata;
+            //const size_t row_size = ne10 * GGML_TYPE_SIZE[vec_dot_type] / GGML_BLCK_SIZE[vec_dot_type];
+            char* yqs = wdata;
+            ggml_fp16_t* yd = wdata + (ne13 * ne12 * ne11 * ne10);
+            const size_t yqs_row_size = ne10;
+            const size_t yd_row_size = ne10/32;
+
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                        quantize_row_q8_0_raw((float*)((char*)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11), yqs, yd, ne10);
+                        yqs += yqs_row_size;
+                        yd += yd_row_size;
+                    }
+                }
+            }
+            return;
+        }
         char * wdata = params->wdata;
         const size_t row_size = ne10*GGML_TYPE_SIZE[vec_dot_type]/GGML_BLCK_SIZE[vec_dot_type];
 
@@ -10048,6 +10185,51 @@ static void ggml_compute_forward_mul_mat_q_f32(
     // row range for this thread
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
+
+    if (nth == 1 && src0->type == GGML_TYPE_Q4_0) { // single threaded only
+        // OpenCL !
+        assert(ir0 == 0);
+        assert(ir1 == nr);
+        void* wdata = params->wdata;
+        ggml_fp16_t* yd = (char*)wdata + (ne13 * ne12 * ne11 * ne10);
+        const size_t src1_width = ne00;// *GGML_TYPE_SIZE[vec_dot_type] / GGML_BLCK_SIZE[vec_dot_type];
+        const size_t src0_width = nb01;
+
+        char* src0_data = (char*)src0->data;
+        //char* dst_data = (char*)dst->data;
+        float* dst_data = (float*)dst->data;
+        int64_t ne = nr * ne11;
+
+        const unsigned int block_count = ne00 / 32;
+        const unsigned int dst_count = ne;
+        const unsigned int dst_bytes = dst_count * sizeof(float);
+        const unsigned int dst_x_width = ne0;
+        const unsigned int dst_y_width = ne1;
+        const unsigned int src0_x_stride = src0_width;
+        const unsigned int src0_bytes = src0_x_stride * ne01 * ne02 * ne03;
+        const unsigned int src0_y_width = ne01;
+        const unsigned int src1_x_stride = src1_width;
+        const unsigned int src1_bytes = src1_x_stride * ne11 * ne12 * ne13;
+        const unsigned int src1_y_width = ne11;
+        ocl_mul_mat_q4_q8_raw(
+            src0_data,
+            wdata, yd,
+            dst_data,
+            src0_bytes,
+            src1_bytes,
+            dst_bytes,
+            src0_y_width,
+            src0_x_stride,
+            src1_y_width,
+            src1_x_stride,
+            block_count,
+            dst_x_width,
+            dst_y_width,
+            dst_count
+        );
+
+        return;
+    }
 
     void * wdata = params->wdata;
     const size_t row_size = ne00*GGML_TYPE_SIZE[vec_dot_type]/GGML_BLCK_SIZE[vec_dot_type];
