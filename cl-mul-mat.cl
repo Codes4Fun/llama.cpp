@@ -321,3 +321,69 @@ __kernel void kernel_mul_mat_q4_q8_raw8(
         output[k] = vec32_dot_q4_q8_raw8(src0_qs, src0_d, src1_qs, src1_d, block_count);
     }
 }
+
+
+
+
+float vec32_dot_q4_q8_interleave(
+   __global uchar *xqs,
+   __global half *xd,
+   const uint xstride,
+   __global char2 *yqs,
+   __global half *yd,
+   const unsigned int nb)
+{
+    float fsum = 0;
+    for (unsigned int j = 0; j < nb; j++) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) {
+            uchar q4 = *xqs;
+            int2 x = (int2)((q4 & 0xf), (q4 >> 4)) - (int2)(8);
+            int2 y = convert_int2(*yqs);
+            x *= y;
+            sum += x.x + x.y;
+            xqs += xstride;
+            yqs++;
+        }
+        fsum += sum * vload_half(0,xd) * vload_half(0,yd);
+        xd += xstride;
+        yd++;
+    }
+    return fsum;
+}
+
+__kernel void kernel_mul_mat_q4_q8_interleave(
+   __global uchar *vxqs,
+   __global half *vxd,
+   __global char2 *vyqs,
+   __global half *vyd,
+   __global float* output,
+    const unsigned int src0_y_width,
+    const unsigned int src0_x_stride,
+    const unsigned int src1_y_width,
+    const unsigned int src1_x_stride,
+    const unsigned int block_count,
+    const unsigned int dst_x_width,
+    const unsigned int dst_y_width,
+    const unsigned int dst_count
+) {
+    int k = get_global_id(0);
+    if(k < dst_count) {
+        const int x = k % dst_x_width;
+        const int yzw = k / dst_x_width;
+        const int y = yzw % dst_y_width;
+        const int zw = yzw / dst_y_width;
+        const int src0_index = (x + src0_y_width * zw);
+        const int src1_index = (y + src1_y_width * zw);
+        __global uchar* src0_qs = (vxqs + (src0_index));// * src0_x_stride));
+        __global half* src0_d = (vxd + (src0_index));// * src0_x_stride / 16));
+        __global char2* src1_qs = (vyqs + (src1_index * src1_x_stride / 2));
+        __global half* src1_d = (vyd + (src1_index * src1_x_stride / 32));
+        output[k] = vec32_dot_q4_q8_interleave(
+            src0_qs, src0_d, src0_y_width,
+            src1_qs, src1_d,
+            block_count
+        );
+    }
+}
+

@@ -4,6 +4,8 @@
 #include <math.h>
 #include "cl-common.h"
 
+#define USE_INTERLEAVE
+
 extern "C" {
 
 typedef uint16_t ggml_fp16_t;
@@ -127,7 +129,11 @@ extern "C" int ocl_mul_mat_q4_q8_init() {
         exit(0);
     }
 
+#ifdef USE_INTERLEAVE
+    kernel_mul_mat_q4_q8_raw = clCreateKernel(program, "kernel_mul_mat_q4_q8_interleave", &err);
+#else
     kernel_mul_mat_q4_q8_raw = clCreateKernel(program, "kernel_mul_mat_q4_q8_raw8", &err);
+#endif
     if (!kernel_mul_mat_q4_q8_raw || err != CL_SUCCESS)
     {
         printf("Error: Failed to create compute kernel! %s\n", getErrorString(err));
@@ -618,6 +624,25 @@ extern "C" void ocl_mul_mat_q4_q8_raw(
             // extract blocks into raw arrays.
             uint8_t* vxqs = (uint8_t*)malloc(src0_qs_bytes + src0_d_bytes);
             ggml_fp16_t* vxd = (ggml_fp16_t*)(vxqs + src0_qs_bytes);
+#ifdef USE_INTERLEAVE
+            int qsi = 0, di = 0;
+            uint8_t* qs = vxqs;
+            ggml_fp16_t* d = vxd;
+            for (int i = 0; i < count; i++) {
+                for (int j = 0; j < 16; j++) {
+                    int x = qsi % src0_x_stride;
+                    int y = qsi / src0_x_stride;
+                    int iqsi = x * src0_y_width + y;
+                    qs[iqsi] = vx[i].qs[j];
+                    qsi++;
+                }
+                int x = di % (src0_x_stride / 16);
+                int y = di / (src0_x_stride / 16);
+                int idi = x * src0_y_width + y;
+                d[idi] = vx[i].d;
+                di++;
+            }
+#else
             uint8_t* qs = vxqs;
             ggml_fp16_t* d = vxd;
             for (int i = 0; i < count; i++) {
@@ -626,6 +651,7 @@ extern "C" void ocl_mul_mat_q4_q8_raw(
                 }
                 *(d++) = vx[i].d;
             }
+#endif
             // write raw arrays
             mem_vx = clCreateBuffer(context, CL_MEM_READ_ONLY, src0_qs_bytes, NULL, &err);
             err = clEnqueueWriteBuffer(commands, mem_vx, CL_TRUE, 0, src0_qs_bytes, vxqs, 0, NULL, NULL);
