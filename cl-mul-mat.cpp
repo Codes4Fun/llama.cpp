@@ -44,9 +44,11 @@ static int ocl_mul_mat_init() {
                 source = buffer;
             } else {
                 printf("source: failed to read.\n");
+                exit(0);
             }
         } else {
             printf("source: skipping, seems too small.\n");
+            exit(0);
         }
         fclose(file);
     } else {
@@ -59,7 +61,7 @@ static int ocl_mul_mat_init() {
     program = clCreateProgramWithSource(context, 1, &source, NULL, &err);
     if (!program)
     {
-        printf("Error: Failed to create compute program!\n");
+        printf("Error: Failed to create compute program! %s\n", getErrorString(err));
         exit(0);
     }
 
@@ -105,7 +107,7 @@ extern "C" int ocl_mul_mat_q4_q8_init() {
     kernel_mul_mat_q4_q8 = clCreateKernel(program, "kernel_mul_mat_q4_q8", &err);
     if (!kernel_mul_mat_q4_q8 || err != CL_SUCCESS)
     {
-        printf("Error: Failed to create compute kernel!\n");
+        printf("Error: Failed to create compute kernel! %s\n", getErrorString(err));
         exit(0);
     }
 
@@ -121,14 +123,14 @@ extern "C" int ocl_mul_mat_q4_q8_init() {
     kernel_mul_mat_q4_q8_half_raw = clCreateKernel(program, "kernel_mul_mat_q4_q8_half_raw", &err);
     if (!kernel_mul_mat_q4_q8_half_raw || err != CL_SUCCESS)
     {
-        printf("Error: Failed to create compute kernel!\n");
+        printf("Error: Failed to create compute kernel! %s\n", getErrorString(err));
         exit(0);
     }
 
     kernel_mul_mat_q4_q8_raw = clCreateKernel(program, "kernel_mul_mat_q4_q8_raw8", &err);
     if (!kernel_mul_mat_q4_q8_raw || err != CL_SUCCESS)
     {
-        printf("Error: Failed to create compute kernel!\n");
+        printf("Error: Failed to create compute kernel! %s\n", getErrorString(err));
         exit(0);
     }
 
