@@ -14402,6 +14402,10 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                             GGML_ASSERT(false);
                         }
 
+                        if (node->src0->type == GGML_TYPE_Q4_0) {
+                            node->n_tasks = 1;
+                        }
+
                         work_size = MAX(work_size, cur);
                     } break;
                 case GGML_OP_SCALE:
