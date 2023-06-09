@@ -39,6 +39,8 @@
 #define LLAMA_USE_SCRATCH
 #define LLAMA_MAX_SCRATCH_BUFFERS 16
 
+extern "C" void ocl_cache(ggml_tensor *);
+
 // available llama models
 enum e_model {
     MODEL_UNKNOWN,
@@ -1105,6 +1107,21 @@ static void llama_model_load_internal(
     }
 
     ml->load_all_data(progress_callback, progress_callback_user_data, use_mlock ? &lctx.model.mlock_mmap : NULL);
+
+    {
+        const int n_layer = hparams.n_layer;
+        for (uint32_t i = 0; i < n_layer; ++i) {
+            auto& layer = model.layers[i];
+            ocl_cache(layer.wq);
+            ocl_cache(layer.wk);
+            ocl_cache(layer.wv);
+            ocl_cache(layer.wo);
+            ocl_cache(layer.w1);
+            ocl_cache(layer.w2);
+            ocl_cache(layer.w3);
+        }
+        ocl_cache(model.output);
+    }
 
 #ifdef GGML_USE_CUBLAS
     {

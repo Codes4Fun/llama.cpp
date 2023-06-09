@@ -1058,8 +1058,6 @@ static void quantize_row_q8_0_reference(const float * restrict x, block_q8_0 * r
     }
 }
 
-#define RAW_FIX
-
 // reference implementation for deterministic creation of model files
 static void quantize_row_q8_0_raw(const float* restrict x, int8_t* restrict yqs, ggml_fp16_t * restrict yd, int k) {
     assert(k % QK8_0 == 0);
@@ -1081,14 +1079,7 @@ static void quantize_row_q8_0_raw(const float* restrict x, int8_t* restrict yqs,
         for (int j = 0; j < QK8_0; ++j) {
             const float x0 = x[i * QK8_0 + j] * id;
 
-#ifdef RAW_FIX
-            if (j < QK8_0/2)
-                yqs[j<<1] = roundf(x0);
-            else
-                yqs[((j - QK8_0/2)<<1) + 1] = roundf(x0);
-#else
             yqs[j] = roundf(x0);
-#endif
         }
         yqs += QK8_0;
     }
@@ -2262,22 +2253,14 @@ static void ggml_vec_dot_q4_0_q8_0_half_raw(const int n, float* restrict s, cons
         for (int j = 0; j < qk / 2; ++j) {
             const int v0 = (x[i].qs[j] & 0x0F) - 8;
             const int v1 = (x[i].qs[j] >> 4) - 8;
-#ifdef RAW_FIX
-            const int y0 = *(yqs++);
-            const int y1 = *(yqs++);
-#else
             const int y0 = *yqs;
             const int y1 = yqs[qk / 2];
             yqs++;
-#endif
             sumi += (v0 * y0) + (v1 * y1);
         }
 
         sumf += sumi * GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(*yd);
-#ifdef RAW_FIX
-#else
         yqs += qk/2;
-#endif
         yd++;
     }
 

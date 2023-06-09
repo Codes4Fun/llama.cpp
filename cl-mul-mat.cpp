@@ -2,9 +2,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <assert.h>
 #include "cl-common.h"
+#include "ggml.h"
 
 #define USE_INTERLEAVE
+#define USE_RAW_FIX
 
 extern "C" {
 
@@ -594,6 +597,123 @@ extern "C" void ocl_mul_mat_q4_q8_half_raw(
 }
 
 
+vx_cache_t ocl_cache_q4(
+    block_q4_0 * vx,
+    const size_t src0_x_stride,
+    const size_t src0_y_width,
+    const size_t src0_bytes,
+    const size_t d_per_y,
+    const size_t qs_per_y
+) {
+    if (mem_vx_cache.count(vx))
+        return mem_vx_cache[vx];
+
+    const size_t block_count = src0_bytes / sizeof(block_q4_0);
+    const size_t src0_qs_bytes = block_count * 16;
+    const size_t src0_d_bytes = block_count * sizeof(vx->d);
+    // extract blocks into raw arrays.
+    uint8_t* vxqs = (uint8_t*)malloc(src0_qs_bytes + src0_d_bytes);
+    ggml_fp16_t* vxd = (ggml_fp16_t*)(vxqs + src0_qs_bytes);
+#ifdef USE_INTERLEAVE
+#ifdef USE_RAW_FIX
+    //memset(vxqs, 0, src0_qs_bytes);
+    size_t qsi = 0, di = 0;
+    uint8_t* qs = vxqs;
+    ggml_fp16_t* d = vxd;
+    uint8_t fixqs[16];
+    for (int i = 0; i < block_count; i++) {
+        for (int j = 0; j < 16; j++) {
+            int value = vx[i].qs[j];
+            int j2 = (j >> 1);
+            if (j & 1) {
+                fixqs[j2] |= (value & 0xf) << 4;
+                fixqs[j2 + 8] |= (value & 0xf0);
+            }
+            else {
+                fixqs[j2] = value & 0xf;
+                fixqs[j2 + 8] = value >> 4;
+            }
+        }
+        for (int j = 0; j < 16; j++) {
+            size_t x = qsi % qs_per_y;
+            size_t y = qsi / qs_per_y;
+            size_t iqsi = x * src0_y_width + y;
+            qs[iqsi] = fixqs[j];
+            qsi++;
+        }
+        size_t x = di % d_per_y;
+        size_t y = di / d_per_y;
+        size_t idi = x * src0_y_width + y;
+        d[idi] = vx[i].d;
+        di++;
+    }
+#else
+    int qsi = 0, di = 0;
+    uint8_t* qs = vxqs;
+    ggml_fp16_t* d = vxd;
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < 16; j++) {
+            int x = qsi % src0_x_stride;
+            int y = qsi / src0_x_stride;
+            int iqsi = x * src0_y_width + y;
+            qs[iqsi] = vx[i].qs[j];
+            qsi++;
+        }
+        int x = di % (src0_x_stride / 16);
+        int y = di / (src0_x_stride / 16);
+        int idi = x * src0_y_width + y;
+        d[idi] = vx[i].d;
+        di++;
+    }
+#endif
+#else
+    uint8_t* qs = vxqs;
+    ggml_fp16_t* d = vxd;
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < 16; j++) {
+            *(qs++) = vx[i].qs[j];
+        }
+        *(d++) = vx[i].d;
+    }
+#endif
+    // write raw arrays
+    cl_int err;
+    cl_mem mem_vx = clCreateBuffer(context, CL_MEM_READ_ONLY, src0_qs_bytes, NULL, &err);
+    err = clEnqueueWriteBuffer(commands, mem_vx, CL_TRUE, 0, src0_qs_bytes, vxqs, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+    {
+        printf("Error: Failed to write to source array!\n");
+        exit(0);
+    }
+    cl_mem mem_vxd = clCreateBuffer(context, CL_MEM_READ_ONLY, src0_d_bytes, NULL, &err);
+    err = clEnqueueWriteBuffer(commands, mem_vxd, CL_TRUE, 0, src0_d_bytes, vxd, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+    {
+        printf("Error: Failed to write to source array!\n");
+        exit(0);
+    }
+    mem_vx_cache[vx] = { mem_vx, mem_vxd };
+    mem_vx_cache_size += src0_qs_bytes + src0_d_bytes;
+    free(vxqs);
+
+    return mem_vx_cache[vx];
+}
+
+extern "C" void ocl_cache(ggml_tensor * src) {
+    if (src->type != GGML_TYPE_Q4_0)
+        return;
+
+    block_q4_0* vx = (block_q4_0*)src->data;
+    const size_t src0_x_stride = src->nb[1];
+    const size_t src0_y_width = src->ne[1];
+    const size_t src0_bytes = src0_x_stride * src->ne[1] * src->ne[2] * src->ne[3];
+    const size_t blocks_per_y = src->ne[0] / 32;
+    const size_t qs_per_y = blocks_per_y * 16;
+    assert(src->ne[2] == 1);
+    assert(src->ne[3] == 1);
+
+    ocl_cache_q4(vx, src0_x_stride, src0_y_width, src0_bytes, blocks_per_y, qs_per_y);
+}
 
 extern "C" void ocl_mul_mat_q4_q8_raw(
     block_q4_0 * vx,
@@ -604,7 +724,7 @@ extern "C" void ocl_mul_mat_q4_q8_raw(
     const unsigned int src1_bytes,
     const unsigned int dst_bytes,
     const unsigned int src0_y_width,
-    const unsigned int _src0_x_stride,
+    const unsigned int src0_x_stride,
     const unsigned int src1_y_width,
     const unsigned int src1_x_stride,
     const unsigned int block_count,
@@ -613,125 +733,13 @@ extern "C" void ocl_mul_mat_q4_q8_raw(
     const unsigned int dst_count
 ) {
     cl_int err;
-    // allocate/reallocate scratch buffers if necessary
-    unsigned int src0_x_stride = block_count * 16;
-    cl_mem mem_vx, mem_vxd;
-    if (src0_cache) {
-        if (!mem_vx_cache.count(vx)) {
-            const int count = src0_bytes / sizeof(block_q4_0);
-            const int src0_qs_bytes = count * 16;
-            const int src0_d_bytes = count * sizeof(vx->d);
-            // extract blocks into raw arrays.
-            uint8_t* vxqs = (uint8_t*)malloc(src0_qs_bytes + src0_d_bytes);
-            ggml_fp16_t* vxd = (ggml_fp16_t*)(vxqs + src0_qs_bytes);
-#ifdef USE_INTERLEAVE
-            int qsi = 0, di = 0;
-            uint8_t* qs = vxqs;
-            ggml_fp16_t* d = vxd;
-            for (int i = 0; i < count; i++) {
-                for (int j = 0; j < 16; j++) {
-                    int x = qsi % src0_x_stride;
-                    int y = qsi / src0_x_stride;
-                    int iqsi = x * src0_y_width + y;
-                    qs[iqsi] = vx[i].qs[j];
-                    qsi++;
-                }
-                int x = di % (src0_x_stride / 16);
-                int y = di / (src0_x_stride / 16);
-                int idi = x * src0_y_width + y;
-                d[idi] = vx[i].d;
-                di++;
-            }
-#else
-            uint8_t* qs = vxqs;
-            ggml_fp16_t* d = vxd;
-            for (int i = 0; i < count; i++) {
-                for (int j = 0; j < 16; j++) {
-                    *(qs++) = vx[i].qs[j];
-                }
-                *(d++) = vx[i].d;
-            }
-#endif
-            // write raw arrays
-            mem_vx = clCreateBuffer(context, CL_MEM_READ_ONLY, src0_qs_bytes, NULL, &err);
-            err = clEnqueueWriteBuffer(commands, mem_vx, CL_TRUE, 0, src0_qs_bytes, vxqs, 0, NULL, NULL);
-            if (err != CL_SUCCESS)
-            {
-                printf("Error: Failed to write to source array!\n");
-                exit(0);
-            }
-            mem_vxd = clCreateBuffer(context, CL_MEM_READ_ONLY, src0_d_bytes, NULL, &err);
-            err = clEnqueueWriteBuffer(commands, mem_vxd, CL_TRUE, 0, src0_d_bytes, vxd, 0, NULL, NULL);
-            if (err != CL_SUCCESS)
-            {
-                printf("Error: Failed to write to source array!\n");
-                exit(0);
-            }
-            mem_vx_cache[vx] = { mem_vx, mem_vxd };
-            mem_vx_cache_size += src0_qs_bytes + src0_d_bytes;
-            free(vxqs);
-        }
-        else {
-            vx_cache_t& cache = mem_vx_cache[vx];
-            mem_vx = cache.vx;
-            mem_vxd = cache.vxd;
-        }
-    }
-    else {
-        const int count = src0_bytes / sizeof(block_q4_0);
-        const int src0_qs_bytes = count * 16;
-        const int src0_d_bytes = count * sizeof(vx->d);
-        // extract blocks into raw arrays.
-        uint8_t* vxqs = (uint8_t*)malloc(src0_qs_bytes + src0_d_bytes);
-        ggml_fp16_t* vxd = (ggml_fp16_t*)(vxqs + src0_qs_bytes);
-        uint8_t* qs = vxqs;
-        ggml_fp16_t* d = vxd;
-        for (int i = 0; i < count; i++) {
-            for (int j = 0; j < 16; j++) {
-                *(qs++) = vx[i].qs[j];
-            }
-            *(d++) = vx[i].d;
-        }
-        // qs
-        if (mem_vx_bytes < src0_qs_bytes) {
-            if (mem_vx_bytes) {
-                clReleaseMemObject(mem_vx_scratch);
-            }
-            mem_vx_scratch = clCreateBuffer(context, CL_MEM_READ_ONLY, src0_qs_bytes, NULL, &err);
-            if (!mem_vx_scratch) {
-                printf("Error: Failed to allocate device memory!\n");
-                exit(0);
-            }
-            mem_vx_bytes = src0_qs_bytes;
-        }
-        mem_vx = mem_vx_scratch;
-        err = clEnqueueWriteBuffer(commands, mem_vx, CL_TRUE, 0, src0_qs_bytes, vx, 0, NULL, NULL);
-        if (err != CL_SUCCESS)
-        {
-            printf("Error: Failed to write to source array!\n");
-            exit(0);
-        }
-        // d
-        if (mem_vxd_bytes < src0_d_bytes) {
-            if (mem_vxd_bytes) {
-                clReleaseMemObject(mem_vxd_scratch);
-            }
-            mem_vxd_scratch = clCreateBuffer(context, CL_MEM_READ_ONLY, src0_d_bytes, NULL, &err);
-            if (!mem_vxd_scratch) {
-                printf("Error: Failed to allocate device memory!\n");
-                exit(0);
-            }
-            mem_vxd_bytes = src0_d_bytes;
-        }
-        mem_vxd = mem_vxd_scratch;
-        err = clEnqueueWriteBuffer(commands, mem_vx, CL_TRUE, 0, src0_d_bytes, vx, 0, NULL, NULL);
-        if (err != CL_SUCCESS)
-        {
-            printf("Error: Failed to write to source array!\n");
-            exit(0);
-        }
-        free(vxqs);
-    }
+
+    const size_t blocks_per_y = src0_x_stride / 18; // 18 is block size
+    const size_t qs_per_y = blocks_per_y * 16; // 16 is number of qs per block
+    vx_cache_t cache = ocl_cache_q4(vx, src0_x_stride, src0_y_width, src0_bytes, blocks_per_y, qs_per_y);
+    cl_mem mem_vx = cache.vx;
+    cl_mem mem_vxd = cache.vxd;
+
     if (mem_vy_bytes < src1_bytes) {
         if (mem_vy_bytes) {
             clReleaseMemObject(mem_vy);
