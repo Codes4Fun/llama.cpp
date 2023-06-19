@@ -129,6 +129,130 @@ void convert_f16(__global half* x, const int ib, const int iqs, float* v0, float
     *v0 = vload_half(0, &x[ib + 0]);
     *v1 = vload_half(0, &x[ib + 1]);
 }
+
+// interleaved full mul mat version
+__kernel void dequantize_mul_mat_q4_0_interleave(
+    __global struct block_q4_0* x,
+    __local float* tmp,
+    __global float* y,
+    __global float* dst,
+    const int max_local_blocks,
+    const int ncols,
+    const int nrows,
+    const int row_stride
+) {
+    const int gid = get_global_id(0);
+
+    const int x_row = gid % row_stride;
+    const int y_row = gid / row_stride;
+
+    const uint qk = QK4_0;
+
+    const int nb = ncols / qk;
+
+    __global uint8_t* xqs = (__global uint8_t*)x;
+    __global half* xd = (__global half*)(xqs + (nrows * ncols / 2));
+    xqs += x_row;
+    xd += x_row;
+    const int xqs_stride = nrows;
+    const int xd_stride = nrows;
+
+    const int iyb_offset = y_row * nb;
+
+    float sum = 0;
+    int iyb = 0;
+    int iybs = 0;
+    for (int ib = 0; ib < nb; ib++) {
+        if (ib == iyb) {
+            const int iybs2 = (ib + iyb_offset) * qk;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            int m = max_local_blocks;
+            if (ib + m > nb) m = nb - ib;
+            event_t e = async_work_group_copy(tmp, y + iybs2, qk * m, 0);
+            wait_group_events(1, &e);
+            iyb = ib + m;
+            iybs = 0;
+        }
+        if (x_row >= nrows)
+            continue;
+        const float d = vload_half(0, xd);
+        xd += xd_stride;
+        for (int iqs = 0; iqs < qk; iqs+=2) {
+            // dequantize
+            const uint8_t vui = xqs[0];
+            xqs += xqs_stride;
+            const float v0 = ((vui & 0xF) - 8) * d;
+            const float v1 = ((vui >> 4) - 8) * d;
+
+            // matrix multiplication
+            sum += v0 * tmp[iybs++];
+            sum += v1 * tmp[iybs++];
+        }
+    }
+    if (x_row < nrows) { // avoid alignment overflow
+        const int di = y_row * nrows + x_row;
+        dst[di] = sum;
+    }
+}
+
+// interleaved vector only optimized version
+__kernel void dequantize_mul_mat_vec_q4_0_interleave(
+    __global struct block_q4_0* x,
+    __local float* tmp,
+    __global float* y,
+    __global float* dst,
+    const int max_local_blocks,
+    const int ncols,
+    const int nrows
+) {
+    const int gid = get_global_id(0);
+
+    const uint qk = QK4_0;
+
+    const int nb = ncols / qk;
+
+    const int x_row = gid;
+
+    __global uint8_t* xqs = (__global uint8_t*)x;
+    __global half* xd = (__global half*)(xqs + (nrows * ncols / 2));
+    xqs += x_row;
+    xd += x_row;
+    const int xqs_stride = nrows;
+    const int xd_stride = nrows;
+
+    float sum = 0;
+    int iyb = 0;
+    int iybs = 0;
+    for (int ib = 0; ib < nb; ib++) {
+        if (ib == iyb) {
+            int m = max_local_blocks;
+            if (ib + m > nb) m = nb - ib;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            event_t e = async_work_group_copy(tmp, y + ib * qk, qk * m, 0);
+            iyb = ib + m;
+            iybs = 0;
+            wait_group_events(1, &e);
+        }
+        if (gid >= nrows)
+            continue;
+        const float d = vload_half(0, xd);
+        xd += xd_stride;
+        for (int iqs = 0; iqs < qk; iqs += 2) {
+            // dequantize
+            const uint8_t vui = xqs[0];
+            xqs += xqs_stride;
+            const float v0 = ((vui & 0xF) - 8) * d;
+            const float v1 = ((vui >> 4) - 8) * d;
+
+            // matrix multiplication
+            sum += v0 * tmp[iybs++];
+            sum += v1 * tmp[iybs++];
+        }
+    }
+    if (gid < nrows) { // avoid alignment overflow
+        dst[x_row] = sum;
+    }
+}
 );
 
 std::string dequant_template = MULTILINE_QUOTE(
@@ -266,12 +390,17 @@ std::string generate_kernels() {
 
 static cl_platform_id platform;
 static cl_device_id device;
+static cl_ulong local_mem_per_cu;
 static cl_context context;
 static cl_command_queue queue;
 static cl_program program;
 static cl_kernel convert_row_f16_cl;
 static cl_kernel dequantize_row_q4_0_cl, dequantize_row_q4_1_cl, dequantize_row_q5_0_cl, dequantize_row_q5_1_cl, dequantize_row_q8_0_cl;
 static cl_kernel dequantize_mul_mat_vec_q4_0_cl, dequantize_mul_mat_vec_q4_1_cl, dequantize_mul_mat_vec_q5_0_cl, dequantize_mul_mat_vec_q5_1_cl, dequantize_mul_mat_vec_q8_0_cl, convert_mul_mat_vec_f16_cl;
+static cl_kernel dequantize_mul_mat_vec_q4_0_interleave_cl;
+static size_t dequantize_mul_mat_vec_q4_0_interleave_local;
+static cl_kernel dequantize_mul_mat_q4_0_interleave_cl;
+static size_t dequantize_mul_mat_q4_0_interleave_local;
 static bool fp16_support;
 
 static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, const char* program_buffer) {
@@ -476,6 +605,14 @@ void ggml_cl_init(void) {
     fp16_support = strstr(ext_buffer, "cl_khr_fp16") != NULL;
     fprintf(stderr, "ggml_opencl: device FP16 support: %s\n", fp16_support ? "true" : "false");
 
+    cl_uint max_compute_units;
+    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(max_compute_units), &max_compute_units, NULL));
+    cl_ulong local_mem_size;
+    CL_CHECK(clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(local_mem_size), &local_mem_size, NULL));
+    fprintf(stderr, "ggml_opencl: max_compute_units: %lu\n", max_compute_units);
+    fprintf(stderr, "ggml_opencl: local_mem_size: %lu\n", local_mem_size);
+    local_mem_per_cu = local_mem_size / max_compute_units;
+
     cl_context_properties properties[] = {
         (intptr_t)CL_CONTEXT_PLATFORM, (intptr_t)platform, 0
     };
@@ -508,6 +645,16 @@ void ggml_cl_init(void) {
     CL_CHECK((dequantize_mul_mat_vec_q5_1_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q5_1", &err), err));
     CL_CHECK((dequantize_mul_mat_vec_q8_0_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q8_0", &err), err));
     CL_CHECK((convert_mul_mat_vec_f16_cl = clCreateKernel(program, "convert_mul_mat_vec_f16", &err), err));
+
+    CL_CHECK((dequantize_mul_mat_vec_q4_0_interleave_cl = clCreateKernel(program, "dequantize_mul_mat_vec_q4_0_interleave", &err), err));
+    CL_CHECK((dequantize_mul_mat_q4_0_interleave_cl = clCreateKernel(program, "dequantize_mul_mat_q4_0_interleave", &err), err));
+
+    CL_CHECK(clGetKernelWorkGroupInfo(dequantize_mul_mat_vec_q4_0_interleave_cl, device, CL_KERNEL_WORK_GROUP_SIZE,
+        sizeof(dequantize_mul_mat_vec_q4_0_interleave_local), &dequantize_mul_mat_vec_q4_0_interleave_local, NULL));
+    CL_CHECK(clGetKernelWorkGroupInfo(dequantize_mul_mat_q4_0_interleave_cl, device, CL_KERNEL_WORK_GROUP_SIZE,
+        sizeof(dequantize_mul_mat_q4_0_interleave_local), &dequantize_mul_mat_q4_0_interleave_local, NULL));
+    fprintf(stderr, "ggml_opencl: dequantize_mul_mat_q4_0_interleave_local: %lu\n", dequantize_mul_mat_q4_0_interleave_local);
+    fprintf(stderr, "ggml_opencl: dequantize_mul_mat_vec_q4_0_interleave_local: %lu\n", dequantize_mul_mat_vec_q4_0_interleave_local);
 }
 
 static cl_kernel* ggml_get_to_fp32_cl(ggml_type type) {
@@ -820,6 +967,14 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
     ggml_cl_pool_free(d_D, d_size);
 }
 
+static bool can_interleave(const ggml_tensor * src) {
+    if (src->type != GGML_TYPE_Q4_0) // only q4 for now
+        return false;
+    if (src->ne[3] != 1 || src->ne[2] != 1) // no extra dimensions
+        return false;
+    return true;
+}
+
 static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -833,6 +988,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
     const int nb3  = dst->nb[3];
     const ggml_type type = src0->type;
     const bool mul_mat_vec = ne11 == 1;
+    const bool interleave = can_interleave(src0);
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -846,7 +1002,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
     size_t d_size;
     size_t q_size;
     cl_mem d_X;
-    if (!mul_mat_vec) {
+    if (!mul_mat_vec && !interleave) {
         d_X = ggml_cl_pool_malloc(sizeof(float) * x_ne, &x_size, CL_MEM_READ_WRITE);
     }
     cl_mem d_Y = ggml_cl_pool_malloc(sizeof(float) * y_ne, &y_size, CL_MEM_READ_ONLY);
@@ -872,7 +1028,30 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
             } else {
                 GGML_ASSERT(false);
             }
-            if (mul_mat_vec) { // specialized dequantize_mul_mat_vec kernel
+            if (interleave) {
+                // copy src1 to device
+                CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
+
+                // compute
+                const size_t local = mul_mat_vec? dequantize_mul_mat_vec_q4_0_interleave_local : dequantize_mul_mat_q4_0_interleave_local;
+                const cl_int row_stride = (ne01 + local - 1) / local * local;
+                const size_t global = row_stride * ne11;
+                const cl_int ncols = ne00;
+                const cl_int nrows = ne01;
+                const cl_int max_local_blocks = local_mem_per_cu / (sizeof(float) * 32);
+                cl_kernel kernel = mul_mat_vec ? dequantize_mul_mat_vec_q4_0_interleave_cl : dequantize_mul_mat_q4_0_interleave_cl;
+                CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_Q));
+                CL_CHECK(clSetKernelArg(kernel, 1, local_mem_per_cu, NULL));
+                CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_Y));
+                CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_mem), &d_D));
+                CL_CHECK(clSetKernelArg(kernel, 4, sizeof(cl_int), &max_local_blocks));
+                CL_CHECK(clSetKernelArg(kernel, 5, sizeof(cl_int), &ncols));
+                CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_int), &nrows));
+                if (!mul_mat_vec)
+                    CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int), &row_stride));
+                CL_CHECK(clFinish(queue));
+                CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global, &local, 0, NULL, &ev_sgemm));
+            } else if (mul_mat_vec) { // specialized dequantize_mul_mat_vec kernel
                 // copy src1 to device
                 CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
 
@@ -924,7 +1103,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
         }
     }
 
-    if (!mul_mat_vec) {
+    if (!mul_mat_vec && !interleave) {
         ggml_cl_pool_free(d_X, x_size);
     }
     ggml_cl_pool_free(d_Y, y_size);
@@ -1012,6 +1191,37 @@ void ggml_cl_transform_tensor(ggml_tensor * tensor) {
 
     size_t q_size;
     cl_mem dst = ggml_cl_pool_malloc(q_sz, &q_size, CL_MEM_READ_ONLY);
+
+    if (can_interleave(tensor)) {
+        void* data = malloc(q_sz);
+        uint8_t* dst_qs = (uint8_t*)data;
+        ggml_fp16_t* dst_d = (ggml_fp16_t*)(dst_qs + ne0*ne1/2);
+        ggml_fp16_t* src_d = (ggml_fp16_t*)tensor->data;
+        uint8_t* src_qs = (uint8_t*)(src_d + 1);
+        for (int row = 0; row < ne1; row++) {
+            for (int ib = 0; ib < ne0 / 32; ib++) {
+                for (int iqs = 0; iqs < 16; iqs++) {
+                    //dst_qs[(ib * 16 + iqs) * ne1 + row] = src_qs[iqs];
+                    int i = (iqs << 1) & 0xf;
+                    int shift = (iqs & 8) >> 1;
+                    uint8_t v0 = (src_qs[i] >> shift) & 0xf;
+                    uint8_t v1 = (src_qs[i+1] >> shift) & 0xf;
+                    dst_qs[(ib * 16 + iqs) * ne1 + row] = v0 | (v1 << 4);
+                }
+                src_qs += 18;
+                dst_d[ib * ne1 + row] = *(src_d);
+                src_d += 9;
+            }
+        }
+        tensor->data = data;
+        CL_CHECK(ggml_cl_h2d_tensor_2d(queue, dst, 0, tensor, 0, 0, NULL));
+        CL_CHECK(clFinish(queue));
+        free(data);
+
+        tensor->data = dst;
+        tensor->backend = GGML_BACKEND_CL;
+        return;
+    }
 
     // copy tensor to device
     for (int64_t i3 = 0; i3 < ne3; i3++) {
