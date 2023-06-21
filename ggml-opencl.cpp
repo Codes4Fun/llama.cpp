@@ -327,12 +327,19 @@ __kernel void dequantize_mul_mat_q4_0_interleave(
         xd += xd_stride;
     }
     const int lid = get_local_id(0);
+    const int cid = lid % cores_per_vec;
     barrier(CLK_LOCAL_MEM_FENCE);
     tmp[lid] = sum;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if ((lid % cores_per_vec) == 0 && x_row < nrows) { // avoid alignment overflow
-        for (int l = 1; l < cores_per_vec; l++)
-            sum += tmp[lid + l];
+    for (int gs = cores_per_vec / 2; gs > 0; gs >>= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (cid < gs) {
+            sum += tmp[lid + gs];
+            if (cid >= (gs >> 1)) {
+                tmp[lid] = sum;
+            }
+        }
+    }
+    if (cid == 0 && x_row < nrows) {
         dst[y_row * nrows + x_row] = sum;
     }
 }
@@ -402,12 +409,19 @@ __kernel void dequantize_mul_mat_vec_q4_0_interleave(
         xd += xd_stride;
     }
     const int lid = get_local_id(0);
+    const int cid = lid % cores_per_vec;
     barrier(CLK_LOCAL_MEM_FENCE);
     tmp[lid] = sum;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    if ((lid % cores_per_vec) == 0 && x_row < nrows) { // avoid alignment overflow
-        for (int l = 1; l < cores_per_vec; l++)
-            sum += tmp[lid + l];
+    for (int gs = cores_per_vec / 2; gs > 0; gs >>= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (cid < gs) {
+            sum += tmp[lid + gs];
+            if (cid >= (gs >> 1)) {
+                tmp[lid] = sum;
+            }
+        }
+    }
+    if (cid == 0 && x_row < nrows) {
         dst[x_row] = sum;
     }
 }
