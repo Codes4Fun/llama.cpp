@@ -15,6 +15,8 @@
 
 #define CL_DMMV_BLOCK_SIZE 32;
 
+const int cores_per_vec = 4;
+
 #define MULTILINE_QUOTE(...) #__VA_ARGS__
 static std::string program_source = MULTILINE_QUOTE(
 
@@ -265,9 +267,10 @@ __kernel void dequantize_mul_mat_q4_0_interleave(
     const int nrows,
     const int row_stride
 ) {
+    const int cores_per_vec = 4;
     const int gid = get_global_id(0);
-    const int x_offset = (gid & 1); // core offset in vector
-    const int did = gid >> 1; // destination id
+    const int x_offset = gid % cores_per_vec; // core offset in vector
+    const int did = gid / cores_per_vec; // destination id
 
     const int x_row = did % row_stride;
     const int y_row = did / row_stride;
@@ -278,9 +281,9 @@ __kernel void dequantize_mul_mat_q4_0_interleave(
 
     __global uint8_t* xqs = (__global uint8_t*)x;
     __global half* xd = (__global half*)(xqs + (nrows * ncols / 2));
-    xqs += x_row * 2 + x_offset; // qs rows are 'thicker' and an offset
+    xqs += x_row * cores_per_vec + x_offset; // qs rows are 'thicker' and an offset
     xd += x_row;
-    const int xqs_stride = nrows * 2; // qs rows are 'thicker'
+    const int xqs_stride = nrows * cores_per_vec; // qs rows are 'thicker'
     const int xd_stride = nrows;
 
     const int iyb_offset = y_row * nb;
@@ -308,7 +311,7 @@ __kernel void dequantize_mul_mat_q4_0_interleave(
         if (x_row >= nrows)
             continue;
         float dsum = 0;
-        for (int iqs = 0; iqs < qk; iqs += 2*2) { // skip double
+        for (int iqs = 0; iqs < qk; iqs += 2*cores_per_vec) { // skip double
             // dequantize
             const uint8_t vui = xqs[0];
             xqs += xqs_stride;
@@ -318,7 +321,7 @@ __kernel void dequantize_mul_mat_q4_0_interleave(
             // matrix multiplication
             dsum += v0 * y2[iybs++];
             dsum += v1 * y2[iybs++];
-            iybs += 2; // skip double
+            iybs += 2*cores_per_vec - 2; // skip double
         }
         sum += dsum * vload_half(0, xd);
         xd += xd_stride;
@@ -327,9 +330,10 @@ __kernel void dequantize_mul_mat_q4_0_interleave(
     barrier(CLK_LOCAL_MEM_FENCE);
     tmp[lid] = sum;
     barrier(CLK_LOCAL_MEM_FENCE);
-    if ((lid & 1) && x_row < nrows) { // avoid alignment overflow
-        const int di = y_row * nrows + x_row;
-        dst[di] = sum + tmp[lid-1];
+    if ((lid % cores_per_vec) == 0 && x_row < nrows) { // avoid alignment overflow
+        for (int l = 1; l < cores_per_vec; l++)
+            sum += tmp[lid + l];
+        dst[y_row * nrows + x_row] = sum;
     }
 }
 
@@ -343,20 +347,21 @@ __kernel void dequantize_mul_mat_vec_q4_0_interleave(
     const int ncols,
     const int nrows
 ) {
+    const int cores_per_vec = 4;
     const int gid = get_global_id(0);
 
     const uint qk = QK4_0;
 
     const int nb = ncols / qk;
 
-    const int x_row = gid >> 1; // two cores now work on the same vector
-    const int x_offset = (gid & 1); // core offset in vector
+    const int x_row = gid / cores_per_vec; // two cores now work on the same vector
+    const int x_offset = gid % cores_per_vec; // core offset in vector
 
     __global uint8_t* xqs = (__global uint8_t*)x;
     __global half* xd = (__global half*)(xqs + (nrows * ncols / 2));
-    xqs += x_row * 2 + x_offset; // qs rows are 'thicker' and an offset
+    xqs += x_row * cores_per_vec + x_offset; // qs rows are 'thicker' and an offset
     xd += x_row;
-    const int xqs_stride = nrows * 2; // qs rows are 'thicker'
+    const int xqs_stride = nrows * cores_per_vec; // qs rows are 'thicker'
     const int xd_stride = nrows;
 
     float sum = 0;
@@ -381,7 +386,7 @@ __kernel void dequantize_mul_mat_vec_q4_0_interleave(
         if (x_row >= nrows)
             continue;
         float dsum = 0;
-        for (int iqs = 0; iqs < qk; iqs += 2*2) { // skip double
+        for (int iqs = 0; iqs < qk; iqs += 2*cores_per_vec) { // skip double
             // dequantize
             const uint8_t vui = xqs[0];
             xqs += xqs_stride;
@@ -391,7 +396,7 @@ __kernel void dequantize_mul_mat_vec_q4_0_interleave(
             // matrix multiplication
             dsum += v0 * y2[iybs++];
             dsum += v1 * y2[iybs++];
-            iybs += 2; // skip double
+            iybs += 2*cores_per_vec - 2; // skip double
         }
         sum += dsum * vload_half(0, xd);
         xd += xd_stride;
@@ -400,8 +405,10 @@ __kernel void dequantize_mul_mat_vec_q4_0_interleave(
     barrier(CLK_LOCAL_MEM_FENCE);
     tmp[lid] = sum;
     barrier(CLK_LOCAL_MEM_FENCE);
-    if ((lid & 1) && x_row < nrows) { // avoid alignment overflow
-        dst[x_row] = sum + tmp[lid-1];
+    if ((lid % cores_per_vec) == 0 && x_row < nrows) { // avoid alignment overflow
+        for (int l = 1; l < cores_per_vec; l++)
+            sum += tmp[lid + l];
+        dst[x_row] = sum;
     }
 }
 
@@ -1187,7 +1194,7 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
                 // compute
                 const size_t local = mul_mat_vec? dequantize_mul_mat_vec_q4_0_interleave_local : dequantize_mul_mat_q4_0_interleave_local;
                 const cl_int row_stride = (ne01 + local - 1) / local * local;
-                const size_t global = row_stride * ne11 * 2;
+                const size_t global = row_stride * ne11 * cores_per_vec;
                 const cl_int ncols = ne00;
                 const cl_int nrows = ne01;
                 const cl_int max_local_blocks = local_mem_per_cu / (sizeof(float) * 32) / 2;
@@ -1358,7 +1365,7 @@ void ggml_cl_transform_tensor(ggml_tensor * tensor) {
                     int shift = (iqs & 8) >> 1;
                     uint8_t v0 = (src_qs[i] >> shift) & 0xf;
                     uint8_t v1 = (src_qs[i + 1] >> shift) & 0xf;
-                    dst_qs[(ib * 16 + iqs) / 2 * ne1 * 2 + row * 2 + (iqs % 2)] = v0 | (v1 << 4);
+                    dst_qs[((ib * 16 + iqs) / cores_per_vec * ne1 + row) * cores_per_vec + (iqs % cores_per_vec)] = v0 | (v1 << 4);
                 }
                 src_qs += 18;
                 dst_d[ib * ne1 + row] = *(src_d);
